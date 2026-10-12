@@ -135,7 +135,7 @@ jobs:
       # The action pin is a commit of this repository that contains action.yml.
       - name: Triage findings into issues
         if: always() && github.event_name == 'pull_request'
-        uses: cybertec-postgresql/security-workflows@22f62d767da5f6868f7ca0693be224fe5ba3c06c
+        uses: cybertec-postgresql/testing_public_gates@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
