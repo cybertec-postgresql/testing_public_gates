@@ -1,0 +1,46 @@
+name: CRA triage
+description: >-
+  Turns scanner findings into issues with a P1 to P4 label, comments the table
+  on the pull request, closes issues when findings leave the head, and
+  reconciles the default branch's alerts once a day. Runs from wherever GitHub
+  delivered this action, so a calling repository needs no checkout of this one
+  and no token beyond its own.
+inputs:
+  command:
+    description: "check (configuration only), pr (triage a pull request), or main (reconcile the default branch)"
+    required: true
+  sarif:
+    description: "SARIF reports to triage for the pr command, space separated"
+    required: false
+    default: ""
+  repo-dir:
+    description: "Checkout of the calling repository, for the main command"
+    required: false
+    default: "."
+runs:
+  using: composite
+  steps:
+    - name: Check triage configuration
+      shell: bash
+      env:
+        PYTHONSAFEPATH: "1"
+      run: PYTHONPATH="$GITHUB_ACTION_PATH" python3 -m triage check
+
+    - name: Triage the pull request findings into issues
+      if: inputs.command == 'pr'
+      shell: bash
+      env:
+        PYTHONSAFEPATH: "1"
+        SARIF: ${{ inputs.sarif }}
+      run: |
+        ARGS=""
+        for s in $SARIF; do [ -f "$s" ] && ARGS="$ARGS --sarif $s"; done
+        PYTHONPATH="$GITHUB_ACTION_PATH" python3 -m triage pr --event "$GITHUB_EVENT_PATH" $ARGS
+
+    - name: Reconcile the default branch's alerts with issues
+      if: inputs.command == 'main'
+      shell: bash
+      env:
+        PYTHONSAFEPATH: "1"
+        REPO_DIR: ${{ inputs.repo-dir }}
+      run: PYTHONPATH="$GITHUB_ACTION_PATH" python3 -m triage main --repo-dir "$REPO_DIR"
