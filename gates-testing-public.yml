@@ -1,0 +1,152 @@
+name: gates-testing-public
+
+# Gate 2 for every private repository in the organisation, called from a ten
+# line workflow in each one (see self-gates.yml here for the shape). A reusable
+# workflow in a private repository can be called only by private repositories
+# of the same organisation, which is exactly the population this serves. Check
+# names as GitHub reports them from a caller job named `gates`:
+# "gates / secret-scan", "gates / scan", "gates / osv-scan" (or
+# "gates / dependency-review" on a public caller). Those are the contexts the
+# ruleset requires.
+#
+# The triage code that turns findings into issues ships in this repository as
+# an action (action.yml at the root). GitHub delivers it to any private
+# repository of the organisation that is allowed to use this repository's
+# components, so a caller needs no checkout of this repository and no token
+# beyond its own.
+
+on:
+  pull_request:
+  
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan the commits being added
+        id: gitleaks
+        continue-on-error: true
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="$HEAD"
+          else
+            RANGE="$BASE..$HEAD"
+          fi
+          echo "scanning $RANGE"
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --log-opts="$RANGE" --redact --no-banner \
+            --report-format sarif --report-path /repo/gitleaks.sarif --exit-code 1
+
+      # Code scanning is a paid feature on private repositories: the upload
+      # is skipped there. The SARIF still reaches the triage step below.
+      - name: Upload SARIF to code scanning
+        if: always() && false && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b # v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Hand the SARIF to the triage step
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          retention-days: 7
+
+      - name: Fail the check on findings
+        if: steps.gitleaks.outcome == 'failure'
+        run: |
+          echo "::error::gitleaks found a committed secret. Rotate it, remove it and rewrite the branch."
+          exit 1
+
+  # Dependency review compares base and head, so it exists only on pull
+  # requests. On a push to main it is skipped, not failed.
+  dependency-review:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          comment-summary-in-pr: on-failure
+
+  # Private repositories: dependency review is paid there, so OSV-Scanner
+  # judges the manifests instead. Note the difference: dependency review
+  # fails only on packages the pull request adds, this fails on any pinned
+  # package with an advisory, so a repository with old pins is red until they
+  # are fixed. That is the honest state of the repository, not a bug.
+  osv-scan:
+    if: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Known CVEs in every lockfile and pinned manifest
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+            ghcr.io/google/osv-scanner:v2.5.1 scan source --no-resolve --allow-no-lockfiles -r .
+
+  scan:
+    runs-on: ubuntu-latest
+    needs: [secret-scan]
+    if: always()
+    container:
+      image: semgrep/semgrep:1.175.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Scan and emit SARIF
+        env:
+          SEMGREP_CONFIG: "p/default"
+        run: |
+          CONFIGS=""
+          for c in $SEMGREP_CONFIG; do CONFIGS="$CONFIGS --config=$c"; done
+          [ -d .semgrep ] && CONFIGS="$CONFIGS --config=.semgrep/"
+          semgrep scan $CONFIGS --metrics=off --sarif -o semgrep.sarif .
+
+      - name: Upload SARIF to code scanning
+        if: always() && false
+        uses: github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b # v3
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Fetch the secret scan report
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gitleaks-sarif
+
+      # The action pin is a commit of this repository that contains action.yml.
+      - name: Triage findings into issues
+        if: always() && github.event_name == 'pull_request'
+        uses: cybertec-postgresql/security-workflows@22f62d767da5f6868f7ca0693be224fe5ba3c06c
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          command: pr
+          sarif: "semgrep.sarif gitleaks.sarif"
+
+      - name: Fail the PR on findings
+        env:
+          SEMGREP_CONFIG: "p/default"
+        run: |
+          CONFIGS=""
+          for c in $SEMGREP_CONFIG; do CONFIGS="$CONFIGS --config=$c"; done
+          [ -d .semgrep ] && CONFIGS="$CONFIGS --config=.semgrep/"
+          semgrep scan $CONFIGS --metrics=off --error .
