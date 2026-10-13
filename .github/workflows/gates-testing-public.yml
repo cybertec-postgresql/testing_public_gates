@@ -39,7 +39,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+          if [ -z "$BASE" ] \vert{}\vert{} [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             RANGE="$HEAD"
           else
             RANGE="$BASE..$HEAD"
@@ -54,7 +54,7 @@ jobs:
       # Code scanning is a paid feature on private repositories: the upload
       # is skipped there. The SARIF still reaches the triage step below.
       - name: Upload SARIF to code scanning
-        if: always() && false && hashFiles('gitleaks.sarif') != ''
+        if: always() && hashFiles('gitleaks.sarif') != ''
         uses: github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b # v3
         with:
           sarif_file: gitleaks.sarif
@@ -120,7 +120,7 @@ jobs:
           semgrep scan $CONFIGS --metrics=off --sarif -o semgrep.sarif .
 
       - name: Upload SARIF to code scanning
-        if: always() && false
+        if: always()
         uses: github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b # v3
         with:
           sarif_file: semgrep.sarif
@@ -134,7 +134,7 @@ jobs:
 
       # The action pin is a commit of this repository that contains action.yml.
       - name: Triage findings into issues
-        if: always() && github.event_name == 'pull_request'
+        if: false
         uses: cybertec-postgresql/testing_public_gates@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
