@@ -51,7 +51,7 @@ jobs:
           echo "::error::gitleaks found a committed secret. Rotate it, remove it and rewrite the branch."
           exit 1
 
-  # 2. CVE SCANNING (Dependency Review - shows CVEs & CVSS in PR and blocks on High/8.0+)
+  # 2. CVE SCANNING (Scans package manifests like requirements.txt, package.json)
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -60,9 +60,9 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
-          comment-summary-in-pr: always
+          comment-summary-in-pr: on-failure
 
-  # 3. STATIC ANALYSIS & CVSS ENRICHMENT
+  # 3. STATIC ANALYSIS & CVSS ENRICHMENT (Scans source code like .py, .js, .go)
   scan:
     runs-on: ubuntu-latest
     needs: [secret-scan]
@@ -80,6 +80,7 @@ jobs:
           ref: main
           path: _cra_config
           sparse-checkout: .cra
+          clean: false
 
       - name: Fetch the secret scan report
         if: always() && github.event_name == 'pull_request'
@@ -95,7 +96,7 @@ jobs:
           CONFIGS=""
           for c in $SEMGREP_CONFIG; do CONFIGS="$CONFIGS --config=$c"; done
           [ -d .semgrep ] && CONFIGS="$CONFIGS --config=.semgrep/"
-          semgrep scan $CONFIGS --metrics=off --sarif -o semgrep.sarif .
+          semgrep scan $CONFIGS --exclude="_cra_config" --metrics=off --sarif -o semgrep.sarif .
 
       - name: Inject CVSS Records into SARIF & Create PR Summary
         id: cvss_gate
@@ -145,3 +146,118 @@ jobs:
                               vector = entry.get("vector", entry.get("vectorString", "CVSS:3.1/..."))
                           elif isinstance(entry, (int, float)):
                               score = float(entry)
+                      
+                      if not score:
+                          if is_secret:
+                              score, vector = 9.0, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N (Secret)"
+                          elif "security-severity" in props:
+                              score = float(props["security-severity"])
+                          else:
+                              level = rule.get("defaultConfiguration", {}).get("level", "warning")
+                              score = 8.5 if level == "error" else (5.5 if level == "warning" else 3.0)
+                              vector = f"Default-Mapping ({level})"
+
+                      # Write CVSS score and record directly into SARIF ticket
+                      props["security-severity"] = str(round(score, 1))
+                      cwe_label = cwe if cwe else "CWE-Unknown"
+                      
+                      # Append visible CVSS record to rule description
+                      cvss_banner = f"\n\n---\n**CRA CVSS Record:**\n- **CVSS Score:** `{score:.1f} / 10.0`\n- **CWE:** `{cwe_label}`\n- **Vector:** `{vector}`\n"
+                      if "fullDescription" in rule and "text" in rule["fullDescription"]:
+                          rule["fullDescription"]["text"] += cvss_banner
+                      elif "shortDescription" in rule and "text" in rule["shortDescription"]:
+                          rule["shortDescription"]["text"] += cvss_banner
+
+                      rule["_cra_meta"] = (cwe_label, score, vector)
+
+                  # Process all results in this run
+                  for res in run.get("results", []):
+                      r_id = res.get("ruleId", "unknown")
+                      rule = rules.get(r_id, {})
+                      cwe_label, score, vector = rule.get("_cra_meta", ("N/A", 5.0, "N/A"))
+                      if score > max_score:
+                          max_score = score
+                      
+                      loc = res.get("locations", [{}])[0].get("physicalLocation", {})
+                      uri = loc.get("artifactLocation", {}).get("uri", "unknown")
+                      line = loc.get("region", {}).get("startLine", 1)
+                      
+                      # Prepend CVSS score to PR annotation message
+                      msg = res.get("message", {}).get("text", "")
+                      res["message"]["text"] = f"[CVSS: {score:.1f} | {cwe_label} | {vector}] {msg}"
+                      
+                      status = "🔴 BLOCK (>= 8.0)" if score >= 8.0 else "🟡 INFO (< 8.0)"
+                      findings_table.append(f"| `{uri}:{line}` | `{r_id}` | `{cwe_label}` | **{score:.1f}** | `{vector}` | {status} |")
+
+              # Clean up temporary metadata before upload
+              for run in data.get("runs", []):
+                  for r in run.get("tool", {}).get("driver", {}).get("rules", []):
+                      r.pop("_cra_meta", None)
+
+              with open(filepath, "w") as f:
+                  json.dump(data, f, indent=2)
+
+          enrich_sarif("gitleaks.sarif", default_cwe="CWE-798", is_secret=True)
+          enrich_sarif("semgrep.sarif", default_cwe=None, is_secret=False)
+
+          # Write Markdown report for PR comment and workflow summary
+          with open("cvss_report.md", "w") as f:
+              f.write("### 🛡️ CRA Security & CVSS Gate Report\n\n")
+              if not findings_table:
+                  f.write("✅ **No security vulnerabilities found (Max CVSS: 0.0).**\n")
+              else:
+                  f.write(f"**Highest detected CVSS Score:** `{max_score:.1f} / 10.0` (Blocking threshold: `8.0`)\n\n")
+                  f.write("| File:Line | Rule | CWE | CVSS Score | CVSS Vector / Source | Gate Status |\n")
+                  f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
+                  for row in findings_table:
+                      f.write(row + "\n")
+
+          with open("max_score.txt", "w") as f:
+              f.write(str(max_score))
+          EOF
+          cat cvss_report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Post CVSS Record Table as PR Comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('cvss_report.md')) return;
+            const body = fs.readFileSync('cvss_report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const botComment = comments.data.find(c => c.body && c.body.includes('CRA Security & CVSS Gate Report'));
+            if (botComment) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: botComment.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Upload Semgrep SARIF to code scanning
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b # v3
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Upload Gitleaks SARIF to code scanning
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b # v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Remove temporary CRA config before final check
+        if: always()
+        run: rm -rf _cra_config
+
+      - name: Block PR if CVSS >= 8.0
+        if: always()
+        run: |
+          SCORE=$(cat max_score.txt)
+          echo "Max detected CVSS Score is: $SCORE"
+          python3 -c "import sys; s=float('$SCORE'); sys.exit(1 if s >= 8.0 else 0)" || {
+            echo "::error::PR blocked! At least one vulnerability has a CVSS score of >= 8.0 (Detected: $SCORE)."
+            exit 1
+          }
