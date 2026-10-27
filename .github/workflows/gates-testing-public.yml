@@ -2,6 +2,8 @@ name: gates-testing-public
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -25,7 +27,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          if [ -z "$BASE" ] \vert{}\vert{} [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             RANGE="$HEAD"
           else
             RANGE="$BASE..$HEAD"
@@ -51,7 +53,7 @@ jobs:
           echo "::error::gitleaks found a committed secret. Rotate it, remove it and rewrite the branch."
           exit 1
 
-  # 2. CVE SCANNING (Scans package manifests like requirements.txt, package.json)
+  # 2. CVE SCANNING (Blocks at High >= 7.0 and Critical >= 9.0)
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -62,7 +64,7 @@ jobs:
           fail-on-severity: high
           comment-summary-in-pr: on-failure
 
-  # 3. STATIC ANALYSIS & CVSS ENRICHMENT (Scans source code like .py, .js, .go)
+  # 3. STATIC ANALYSIS & CVSS ENRICHMENT
   scan:
     runs-on: ubuntu-latest
     needs: [secret-scan]
@@ -114,6 +116,17 @@ jobs:
           findings_table = []
           max_score = 0.0
 
+          def get_severity_word(score):
+              if score >= 9.0:
+                  return "Critical"
+              elif score >= 7.0:
+                  return "High"
+              elif score >= 4.0:
+                  return "Medium"
+              elif score >= 0.1:
+                  return "Low"
+              return "None"
+
           def enrich_sarif(filepath, default_cwe="CWE-798", is_secret=False):
               global max_score
               if not os.path.exists(filepath):
@@ -157,8 +170,10 @@ jobs:
                               score = 8.5 if level == "error" else (5.5 if level == "warning" else 3.0)
                               vector = f"Default-Mapping ({level})"
 
-                      # Write CVSS score and record directly into SARIF ticket
+                      # Write exact CVSS score and level into SARIF (blocks >= 7.0)
                       props["security-severity"] = str(round(score, 1))
+                      rule.setdefault("defaultConfiguration", {})["level"] = "error" if score >= 7.0 else "warning"
+
                       cwe_label = cwe if cwe else "CWE-Unknown"
                       
                       # Append visible CVSS record to rule description
@@ -178,6 +193,8 @@ jobs:
                       if score > max_score:
                           max_score = score
                       
+                      res["level"] = "error" if score >= 7.0 else "warning"
+
                       loc = res.get("locations", [{}])[0].get("physicalLocation", {})
                       uri = loc.get("artifactLocation", {}).get("uri", "unknown")
                       line = loc.get("region", {}).get("startLine", 1)
@@ -186,7 +203,7 @@ jobs:
                       msg = res.get("message", {}).get("text", "")
                       res["message"]["text"] = f"[CVSS: {score:.1f} | {cwe_label} | {vector}] {msg}"
                       
-                      status = "🔴 BLOCK (>= 8.0)" if score >= 8.0 else "🟡 INFO (< 8.0)"
+                      status = get_severity_word(score)
                       findings_table.append(f"| `{uri}:{line}` | `{r_id}` | `{cwe_label}` | **{score:.1f}** | `{vector}` | {status} |")
 
               # Clean up temporary metadata before upload
@@ -206,7 +223,7 @@ jobs:
               if not findings_table:
                   f.write("✅ **No security vulnerabilities found (Max CVSS: 0.0).**\n")
               else:
-                  f.write(f"**Highest detected CVSS Score:** `{max_score:.1f} / 10.0` (Blocking threshold: `8.0`)\n\n")
+                  f.write(f"**Highest detected CVSS Score:** `{max_score:.1f} / 10.0` (Blocking threshold: `7.0`)\n\n")
                   f.write("| File:Line | Rule | CWE | CVSS Score | CVSS Vector / Source | Gate Status |\n")
                   f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
                   for row in findings_table:
@@ -252,12 +269,12 @@ jobs:
         if: always()
         run: rm -rf _cra_config
 
-      - name: Block PR if CVSS >= 8.0
+      - name: Block PR if CVSS >= 7.0
         if: always()
         run: |
           SCORE=$(cat max_score.txt)
           echo "Max detected CVSS Score is: $SCORE"
-          python3 -c "import sys; s=float('$SCORE'); sys.exit(1 if s >= 8.0 else 0)" || {
-            echo "::error::PR blocked! At least one vulnerability has a CVSS score of >= 8.0 (Detected: $SCORE)."
+          python3 -c "import sys; s=float('$SCORE'); sys.exit(1 if s >= 7.0 else 0)" || {
+            echo "::error::PR blocked! At least one vulnerability has a CVSS score of >= 7.0 (Detected: $SCORE)."
             exit 1
           }
